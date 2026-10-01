@@ -41,3 +41,9 @@ def feature_anomaly_map(ext, ae, x, device, out_size=256, sigma=4):
     err = ((f - ae(f)) ** 2).mean(1, keepdim=True)                 # 1 x 1 x 32 x 32
     err = F.interpolate(err, size=out_size, mode="bilinear", align_corners=False)
     return cv2.GaussianBlur(err[0, 0].cpu().numpy(), (0, 0), sigma)
+
+@torch.no_grad()
+def map_from_features(f, ae, out_size=256, sigma=4):
+    err = ((f - ae(f)) ** 2).mean(1, keepdim=True)
+    err = F.interpolate(err, size=out_size, mode="bilinear", align_corners=False)
+    return cv2.GaussianBlur(err[0, 0].cpu().numpy(), (0, 0), sigma)

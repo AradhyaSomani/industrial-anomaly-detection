@@ -1,17 +1,18 @@
 import glob, json, os, sys, time
-from anyio import amap
 import numpy as np, torch, cv2, gradio as gr
 
 sys.path.append("src")
 from dataset import get_test_transform
 from model import ConvAE
-from feature_model import FeatureExtractor, FeatureAE, feature_anomaly_map
+from feature_model import FeatureExtractor, FeatureAE, feature_anomaly_map, map_from_features
 from scoring import get_device, reconstruct, error_maps, smooth, combine, image_score
 
 device = get_device()
 tf = get_test_transform()
-CATS = sorted(c for c in os.listdir("data")
-              if os.path.exists(f"checkpoints/{c}.pt") or os.path.exists(f"checkpoints_feat/{c}.pt"))
+CATS = sorted(os.path.basename(p)[:-3] for p in glob.glob("checkpoints_feat/*.pt")
+              if "_val_idx" not in p)
+_ext = FeatureExtractor().to(device)   # load the backbone once at startup
+_cache = {}
 
 def img_auroc(path):
     try:
@@ -24,12 +25,9 @@ def best_model(cat):
     pix = img_auroc(f"outputs_pixel_baseline/{cat}/results.json")
     return "feature" if feat >= pix else "pixel"
 
-_ext, _cache = None, {}
 def load(cat, kind):
-    global _ext
     if (cat, kind) in _cache: return _cache[(cat, kind)]
     if kind == "feature":
-        if _ext is None: _ext = FeatureExtractor().to(device)
         cal = json.load(open(f"checkpoints_feat/{cat}_calib.json"))
         m = FeatureAE(latent=cal["latent"]).to(device)
         m.load_state_dict(torch.load(f"checkpoints_feat/{cat}.pt", map_location=device))
@@ -43,20 +41,19 @@ def load(cat, kind):
     return entry
 
 def detect_category(x):
-    global _ext
-    if _ext is None: _ext = FeatureExtractor().to(device)
+    with torch.no_grad():
+        f = _ext(x.unsqueeze(0).to(device))   # backbone runs once, reused for every category
     best, best_ratio = None, float("inf")
     for c in CATS:
-        if not os.path.exists(f"checkpoints_feat/{c}.pt"): continue
         ae, thr, _ = load(c, "feature")
-        ratio = image_score(feature_anomaly_map(_ext, ae, x, device)) / thr
+        ratio = image_score(map_from_features(f, ae)) / thr
         if ratio < best_ratio: best, best_ratio = c, ratio
     return best
 
 def predict(img, cat, choice, scale):
     if img is None:
         return None, None, "Upload an image first."
-        x = tf(img.convert("RGB"))
+    x = tf(img.convert("RGB"))
     detected = cat == "Auto-detect"
     if detected: cat = detect_category(x)
     kind = best_model(cat) if choice.startswith("Auto") else choice.lower()
@@ -118,4 +115,4 @@ with gr.Blocks(title="Industrial Anomaly Detection") as demo:
     btn.click(predict, args, [out_heat, out_box, out_txt])
     scale.release(predict, args, [out_heat, out_box, out_txt])
 
-demo.launch()
+demo.launch(share=True)
