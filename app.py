@@ -1,5 +1,6 @@
 import glob, json, os, sys, time
 import numpy as np, torch, cv2, gradio as gr
+import torch.nn.functional as F
 
 sys.path.append("src")
 from dataset import get_test_transform
@@ -12,6 +13,8 @@ tf = get_test_transform()
 CATS = sorted(os.path.basename(p)[:-3] for p in glob.glob("checkpoints_feat/*.pt")
               if "_val_idx" not in p)
 _ext = FeatureExtractor().to(device)   # load the backbone once at startup
+_idx = torch.load("checkpoints_feat/category_index.pth")
+_emb, _lab = _idx["emb"].to(device), _idx["labels"].to(device)
 _cache = {}
 
 def img_auroc(path):
@@ -42,13 +45,10 @@ def load(cat, kind):
 
 def detect_category(x):
     with torch.no_grad():
-        f = _ext(x.unsqueeze(0).to(device))   # backbone runs once, reused for every category
-    best, best_ratio = None, float("inf")
-    for c in CATS:
-        ae, thr, _ = load(c, "feature")
-        ratio = image_score(map_from_features(f, ae)) / thr
-        if ratio < best_ratio: best, best_ratio = c, ratio
-    return best
+        f = _ext(x.unsqueeze(0).to(device))
+    q = F.normalize(f.mean(dim=(2, 3)), dim=1)
+    top = (q @ _emb.T)[0].topk(5).indices
+    return _idx["cats"][int(torch.mode(_lab[top].cpu()).values)]
 
 def predict(img, cat, choice, scale):
     if img is None:

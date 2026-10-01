@@ -28,7 +28,8 @@ Training runs once per category from the command line. Everything the app needs 
 | `src/scoring.py` | device selection, error maps, normalization, smoothing, image score |
 | `src/train.py`, `src/evaluate.py` | train and evaluate the pixel model (L2, SSIM and combined scoring) |
 | `src/feature_model.py` | WideResNet-50 feature extractor, feature autoencoder, feature anomaly map |
-| `src/train_feat.py`, `src/evaluate_feat.py` | train and evaluate the feature model |
+| `src/train_feat.py`, `src/evaluate_feat.py` | train and evaluate the feature model (`--size`, `--topk` options) |
+| `src/build_category_index.py`, `src/eval_autodetect.py` | build the category-detection index; measure detection accuracy |
 | `app.py` | Gradio demo |
 | `checkpoints/`, `checkpoints_feat/` | weights, validation indices and calibration files per category |
 | `outputs_pixel_baseline/`, `outputs_feat/` | `results.json` and `qualitative.png` per category |
@@ -117,6 +118,31 @@ Feature reconstruction raised mean image AUROC from 0.749 to 0.922 and mean pixe
 
 The largest gains are on cable, carpet and tile, where the pixel model was near or below random. Screw and toothbrush are the only drops, so the demo keeps the pixel model for those two.
 
+**Run-to-run stability (feature autoencoder, 3 training runs per category).** The headline result is stable: mean image AUROC 0.923 ± 0.005 and mean pixel AUROC 0.971 ± 0.000 across runs. The chart above shows a single run; the table gives mean ± standard deviation.
+
+| Category | Image AUROC | Pixel AUROC |
+| --- | --- | --- |
+| bottle | 1.000 ± 0.000 | 0.985 ± 0.000 |
+| cable | 0.922 ± 0.013 | 0.969 ± 0.002 |
+| capsule | 0.906 ± 0.009 | 0.989 ± 0.000 |
+| carpet | 0.980 ± 0.006 | 0.988 ± 0.001 |
+| grid | 0.860 ± 0.046 | 0.956 ± 0.005 |
+| hazelnut | 0.998 ± 0.001 | 0.984 ± 0.000 |
+| leather | 0.998 ± 0.001 | 0.992 ± 0.000 |
+| metal_nut | 0.995 ± 0.001 | 0.975 ± 0.001 |
+| pill | 0.917 ± 0.007 | 0.982 ± 0.001 |
+| screw | 0.431 ± 0.076 | 0.967 ± 0.003 |
+| tile | 0.997 ± 0.002 | 0.955 ± 0.002 |
+| toothbrush | 0.949 ± 0.005 | 0.988 ± 0.000 |
+| transistor | 0.931 ± 0.020 | 0.906 ± 0.003 |
+| wood | 0.987 ± 0.000 | 0.942 ± 0.003 |
+| zipper | 0.975 ± 0.002 | 0.985 ± 0.000 |
+| **Mean** | **0.923 ± 0.005** | **0.971 ± 0.000** |
+
+- Grid is the least stable category (± 0.046); its single-run 0.926 in the chart was a favorable run.
+- Toothbrush's drop against the pixel model (0.949 ± 0.005 vs 0.986) is consistent across runs, so choosing the pixel model there is justified.
+- Screw's spread (± 0.076) is larger than the effect of any change tried on it (see failure analysis).
+
 **Scoring ablation (pixel autoencoder, bottle).** SSIM error separates bottle defects far better than squared pixel error.
 
 | Scoring | Image AUROC | Pixel AUROC | F1 at threshold |
@@ -131,7 +157,17 @@ Bottle defects (cracks, broken rims, contamination) are structural changes that 
 
 - **Pixel model on textures (carpet 0.488).** It cannot reproduce fine detail such as carpet fibers, so every image has high error and good and bad look alike. Its pixel AUROC stayed at 0.910: the heatmaps found the defects, but scattered error on normal images swamped the image score.
 - **Pixel model on cable (0.319, worse than random).** Some cable defects are logical, such as a missing wire or swapped colors. A missing wire makes the image simpler to reconstruct, so it scores as more normal. Pretrained features encode color and part identity, which lifts cable to 0.918.
-- **Screw, both models (0.474 pixel, 0.364 feature).** Screws appear at arbitrary angles, but training covers only 90° rotations, so a normal screw at an unusual angle scores like a defect. Localization is still good (pixel AUROC 0.968), so the defects are found but the image score cannot separate the classes.
+- **Screw, both models (0.474 pixel, 0.431 ± 0.076 feature).** Localization is good (pixel AUROC 0.967), but image scores for good and defective screws overlap almost completely: every group's mean falls between 0.0034 and 0.0041, and thread defects score lower than good screws on average. The screw's baseline reconstruction error dominates the score, and a defect adds little on top. The likely cause is resolution: each cell of the 32×32 feature map covers a 32×32-pixel patch of the original 1024-pixel photo, so a small scratch or thread defect barely changes its cell's feature vector. Experiments, all within the run-to-run spread:
+
+    | Change | Image AUROC |
+    | --- | --- |
+    | Baseline (90° rotations, top 1% score, 256 px) | 0.364 |
+    | Full-range rotation augmentation | 0.324 |
+    | Full rotation + score from top 0.1% of pixels | 0.346 |
+    | Full rotation + score from top 0.01% of pixels | 0.350 |
+    | 512 px input (64×64 feature map) | 0.424 |
+
+    Doubling resolution helped most, which supports the resolution explanation, but did not lift screw above chance. Screw remains a documented limitation; the demo uses the pixel model for it.
 - **Toothbrush (0.986 pixel, 0.944 feature).** A small drop on a small dataset, likely within run-to-run variance.
 
 ![Carpet: input, anomaly map and ground truth per defect type](carpet_qualitative.png)
@@ -155,9 +191,16 @@ Bottle defects (cracks, broken rims, contamination) are structural changes that 
 - **Flagged regions:** bounding boxes drawn only when the image is anomalous, around connected regions above the larger of the threshold and half the map's maximum; regions under 30 pixels are dropped.
 - **Result:** verdict, detected category, score, threshold, model used, and inference time.
 
-**Automatic category detection.** The WideResNet backbone runs once on the image. Its features are passed to all 15 feature autoencoders, and the image is assigned to the category with the lowest ratio of score to that category's threshold, where it looks most normal. Without this, a hazelnut inspected with the bottle model lit up the whole frame, because every part of it looked abnormal to that model.
+**Automatic category detection.** Inspecting an image with the wrong category's model makes the whole frame look anomalous (a hazelnut checked by the bottle model lights up everywhere), so the app identifies the product first. It reduces the WideResNet feature map to one global vector (the average over all positions, L2-normalized) and assigns the category held by most of the 5 nearest training images (`src/build_category_index.py`, index of 3,629 normal training images). It routes all 1,725 MVTec test images correctly.
 
-**Performance.** The backbone is loaded once at startup, and each category's autoencoder is cached on first use. Running the backbone once per image, instead of once per category, keeps auto-detection fast enough for CPU hosting.
+The first version used a different rule: assign the category whose autoencoder finds the image most normal (lowest score ÷ threshold). Measured with `src/eval_autodetect.py`, it was right for 99.6% of good images but only 68.8% of defective ones, because a defect is designed to make an image look abnormal to its own model. Misrouted images went mostly to screw and hazelnut, whose models score every image in a narrow band. In the demo this was a silent failure: a damaged carpet could be routed to the screw model and reported as normal. A global feature vector describes what the product is, and a small local defect barely moves it.
+
+| Method | Good images | Defective images | Overall (1,725) |
+| --- | --- | --- | --- |
+| Lowest score ÷ threshold | 99.6% | 68.8% | 77.2% |
+| 5 nearest training images, global features | 100% | 100% | 100% |
+
+**Performance.** The backbone is loaded once at startup and runs once per image; its output serves both category detection (one matrix product against the index) and scoring. Each category's autoencoder is cached on first use.
 
 **Hosting.** The demo runs locally with `python app.py`. For a temporary public link, change the last line to `demo.launch(share=True)`; the link works while the app is running.
 
@@ -220,14 +263,17 @@ The biggest open gap is screw (image AUROC 0.364), followed by the noisy thresho
 
 - **One model per category.** Fifteen checkpoints must be stored and loaded; a single multi-class model would be simpler to deploy.
 - **Small calibration sets.** Thresholds come from about 10–60 normal images per category, so they shift between runs. A production system would calibrate on more data and set the operating point from the cost of a missed defect versus a false alarm.
-- **Single training run per category.** Bottle's pixel-model pixel AUROC moved from about 0.91 to 0.766 between two runs with the same settings, so small differences in the results table may be noise.
+- **Run-to-run variance.** The feature model was trained three times per category (mean ± std above); the pixel model was trained once, and its bottle pixel AUROC moved from about 0.91 to 0.766 between two identical runs, so small pixel-model differences may be noise.
 - **Logical defects.** Reconstruction error cannot directly detect "parts in the wrong arrangement"; feature reconstruction helps (cable 0.918) but does not guarantee it.
 - **Controlled imaging assumed.** MVTec images have fixed lighting, background and framing. Photos taken under other conditions would fall outside what the models learned as normal.
 
 **Future work**
 
-- [ ] Full-range rotation augmentation for screw (`RandomRotation(180)`), and scoring by the top 0.01% of pixels so small defects are not diluted
-- [ ] Report mean ± standard deviation over three seeds per category
+- [x] Full-range rotation augmentation and finer top-k scoring for screw (no gain beyond run-to-run spread)
+- [x] 512 px input for screw (0.364 → 0.424, still below chance)
+- [x] Report mean ± standard deviation over three runs per category
+- [x] Measure automatic category detection, and replace the score-based rule with nearest neighbors on global features (68.8% → 100% on defective images)
+- [ ] Screw: tile-based inference at full 1024 px resolution, or a rotation-invariant representation
 - [ ] Add the PRO score, the official MVTec localization metric
 - [ ] Break results down by defect type
 - [ ] Benchmark against PatchCore via `anomalib` on the same categories
