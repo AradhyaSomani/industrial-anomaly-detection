@@ -4,14 +4,14 @@ Aradhya Somani · September 2026
 
 ## Overview
 
-The system detects and localizes manufacturing defects without any labeled defects. Its main model reaches a mean image-level AUROC of 0.922 and a mean pixel-level AUROC of 0.971 across the 15 MVTec AD categories.
+The system detects and localizes manufacturing defects without any labeled defects. Its best model, PatchCore with a 1% memory bank, reaches a mean image-level AUROC of 0.982 and a mean pixel-level AUROC of 0.980 across the 15 MVTec AD categories, at about 11 ms per image.
 
 Models are trained only on images of good parts. At inspection time, anything the model cannot reconstruct as "normal" is flagged, and the reconstruction error map shows where the defect is.
 
 - **Problem:** real production lines produce few defects, and new defect types appear without warning. Collecting and pixel-labeling enough defects to train a supervised classifier is slow and expensive, and such a classifier misses defect types it never saw.
 - **Approach:** learn what normal looks like, one model per product category, and treat deviation from it as an anomaly. No anomaly labels are used for training or for choosing the decision threshold; test labels and masks are used only to report metrics.
-- **Two models:** a pixel-reconstruction convolutional autoencoder (baseline, mean image AUROC 0.749) and a feature-reconstruction autoencoder over a frozen WideResNet-50 (main model, 0.922).
-- **Deliverable:** a Gradio web app that takes an uploaded image, detects its product category, and returns an anomaly heatmap, bounding boxes around suspect regions, and a verdict in about 30 ms on an Apple-silicon GPU.
+- **Three models, built in order:** a pixel-reconstruction convolutional autoencoder (baseline, mean image AUROC 0.749), a feature-reconstruction autoencoder over a frozen WideResNet-50 (0.923 ± 0.005 over three runs), and PatchCore on the same features (0.982).
+- **Deliverable:** a Gradio web app that takes an uploaded image, detects its product category, picks the best model for it, and returns an anomaly heatmap, bounding boxes around suspect regions, and a verdict in about 11 ms on an Apple-silicon GPU.
 
 ## System architecture
 
@@ -29,6 +29,7 @@ Training runs once per category from the command line. Everything the app needs 
 | `src/train.py`, `src/evaluate.py` | train and evaluate the pixel model (L2, SSIM and combined scoring) |
 | `src/feature_model.py` | WideResNet-50 feature extractor, feature autoencoder, feature anomaly map |
 | `src/train_feat.py`, `src/evaluate_feat.py` | train and evaluate the feature model (`--size`, `--topk` options) |
+| `src/patchcore.py` | PatchCore: coreset memory bank, evaluation, bank and threshold saved for the app |
 | `src/build_category_index.py`, `src/eval_autodetect.py` | build the category-detection index; measure detection accuracy |
 | `app.py` | Gradio demo |
 | `checkpoints/`, `checkpoints_feat/` | weights, validation indices and calibration files per category |
@@ -79,6 +80,15 @@ Both models are autoencoders trained on normal images only; the feature model wi
 - **Frozen backbone:** WideResNet-50-2 with ImageNet weights, kept in eval mode so BatchNorm statistics never change. Layer 2 (512×32×32) and layer 3 (1024×16×16, upsampled to 32×32) are concatenated, then averaged over a 3×3 neighborhood to add local context.
 - **1×1 convolutions:** each spatial location is reconstructed independently, so the model learns which feature vectors are normal rather than memorizing image layout.
 - **Why it works:** pretrained features already encode texture, color and part identity. Fine texture damage and swapped or missing parts, which are invisible in pixel error, become large feature errors.
+
+**PatchCore** (`src/patchcore.py`, after Roth et al., CVPR 2022)
+
+PatchCore uses the same `FeatureExtractor` (WideResNet-50 layers 2 + 3, 1536 channels at 32×32, 3×3 local averaging) but stores normal patches instead of learning to reconstruct them. Holding the backbone, layers, resolution and validation split fixed isolates one design choice: reconstruction versus lookup.
+
+- **Memory bank:** every 32×32 patch feature from the 85% training split (no augmentation), reduced by greedy coreset selection: iterative farthest-point sampling on a random 128-dimensional projection, keeping 1% of patches (522–3,409 per category, about 3–21 MB).
+- **Scoring:** a test patch's score is the Euclidean distance to its nearest neighbour in the bank; the map is upsampled to 256×256 and blurred (σ = 4); the image score is the map's maximum.
+- **No training:** building a bank takes 2–46 s per category. The bank and its 95th-percentile threshold are saved to `checkpoints_patchcore/` for the app.
+- **Simplifications:** no score reweighting and no channel reduction, both used in the paper, which reports about 0.99 mean image AUROC.
 
 ## Anomaly scoring and threshold calibration
 
@@ -143,6 +153,39 @@ The largest gains are on cable, carpet and tile, where the pixel model was near 
 - Toothbrush's drop against the pixel model (0.949 ± 0.005 vs 0.986) is consistent across runs, so choosing the pixel model there is justified.
 - Screw's spread (± 0.076) is larger than the effect of any change tried on it (see failure analysis).
 
+**Benchmark: PatchCore on the same features.** PatchCore (1% coreset) reaches a mean image AUROC of 0.982 and pixel AUROC of 0.980, the best or tied-best result on 13 of 15 categories. Feature-autoencoder values are three-run means.
+
+| Category | Pixel AE | Feature AE | PatchCore | Feature AE (pix) | PatchCore (pix) |
+| --- | --- | --- | --- | --- | --- |
+| bottle | 0.969 | 1.000 | 1.000 | 0.985 | 0.986 |
+| cable | 0.319 | 0.922 | 0.998 | 0.969 | 0.986 |
+| capsule | 0.674 | 0.906 | 0.978 | 0.989 | 0.988 |
+| carpet | 0.488 | 0.980 | 0.991 | 0.988 | 0.990 |
+| grid | 0.872 | 0.860 | 0.971 | 0.956 | 0.981 |
+| hazelnut | 0.919 | 0.998 | 1.000 | 0.984 | 0.988 |
+| leather | 0.764 | 0.998 | 1.000 | 0.992 | 0.993 |
+| metal_nut | 0.792 | 0.995 | 1.000 | 0.975 | 0.986 |
+| pill | 0.840 | 0.917 | 0.954 | 0.982 | 0.978 |
+| screw | 0.474 | 0.431 | 0.940 | 0.967 | 0.974 |
+| tile | 0.647 | 0.997 | 1.000 | 0.955 | 0.958 |
+| toothbrush | 0.986 | 0.949 | 0.928 | 0.988 | 0.988 |
+| transistor | 0.645 | 0.931 | 0.998 | 0.906 | 0.971 |
+| wood | 0.930 | 0.987 | 0.986 | 0.942 | 0.944 |
+| zipper | 0.924 | 0.975 | 0.985 | 0.985 | 0.987 |
+| **Mean** | **0.749** | **0.923** | **0.982** | **0.971** | **0.980** |
+
+- **Screw (0.431 → 0.940)** is the clearest result: the same features scored by nearest-neighbour lookup succeed where reconstruction failed. The autoencoder generalizes well enough to reconstruct a slightly damaged thread; a damaged thread has no close match among stored normal patches.
+- **Toothbrush** is the exception: with only 51 training images (a 522-patch bank), PatchCore scores 0.928 and the pixel autoencoder 0.986.
+
+**Coreset size.** Keeping 1% of patches instead of 10% changes nothing measurable and makes PatchCore smaller and faster.
+
+| Coreset | Mean image AUROC | Mean pixel AUROC | Bank per category | Build time | Inference |
+| --- | --- | --- | --- | --- | --- |
+| 10% | 0.980 | 0.981 | 5,222–34,099 patches (~30–210 MB) | 9 s – 6 min | 13–41 ms |
+| 1% | 0.982 | 0.980 | 522–3,409 patches (~3–21 MB) | 2–46 s | 11–12 ms |
+
+For comparison, the feature autoencoder's weights are about 14 MB per category and take 10–15 minutes to train.
+
 **Scoring ablation (pixel autoencoder, bottle).** SSIM error separates bottle defects far better than squared pixel error.
 
 | Scoring | Image AUROC | Pixel AUROC | F1 at threshold |
@@ -167,14 +210,14 @@ Bottle defects (cracks, broken rims, contamination) are structural changes that 
     | Full rotation + score from top 0.01% of pixels | 0.350 |
     | 512 px input (64×64 feature map) | 0.424 |
 
-    Doubling resolution helped most, which supports the resolution explanation, but did not lift screw above chance. Screw remains a documented limitation; the demo uses the pixel model for it.
+    Doubling resolution helped most but did not lift screw above chance. PatchCore on the same 256-pixel features then reached 0.940, which shows the limit was the reconstruction approach rather than resolution: the feature autoencoder reconstructs slightly damaged threads too well. The demo uses PatchCore for screw.
 - **Toothbrush (0.986 pixel, 0.944 feature).** A small drop on a small dataset, likely within run-to-run variance.
 
 ![Carpet: input, anomaly map and ground truth per defect type](carpet_qualitative.png)
 
 ## Demo application
 
-`app.py` is a Gradio app that inspects an uploaded image in about 11–32 ms on an Apple-silicon GPU (measured on zipper, bottle and hazelnut images) and identifies the product category automatically.
+`app.py` is a Gradio app that identifies the product category automatically and inspects an uploaded image in about 11 ms with PatchCore (about 30 ms with the autoencoders) on an Apple-silicon GPU.
 
 ![Demo](demo.gif)
 
@@ -182,7 +225,7 @@ Bottle defects (cracks, broken rims, contamination) are structural changes that 
 
 - **Image:** any upload, or one of the one-click examples in `examples/` (a good and a defective image for bottle, carpet, hazelnut, screw and zipper).
 - **Product category:** `Auto-detect` (default) or one of the trained categories, listed from the files in `checkpoints_feat/`.
-- **Model:** `Auto (best per category)`, `Feature` or `Pixel`. Auto compares each category's image AUROC in `outputs_feat/` and `outputs_pixel_baseline/` and uses the better model, so toothbrush and screw use the pixel model and the other 13 use the feature model.
+- **Model:** `Auto (best per category)`, `PatchCore`, `Feature AE` or `Pixel AE`. Auto compares each category's image AUROC in `outputs_patchcore/`, `outputs_feat/` and `outputs_pixel_baseline/` and uses the best, which is PatchCore for 13 categories, the pixel autoencoder for toothbrush and the feature autoencoder for wood.
 - **Threshold scale:** a slider from 0.5 to 1.5 that multiplies the calibrated threshold, to show the precision/recall trade-off live.
 
 **Outputs**
@@ -257,7 +300,7 @@ Everything runs locally with Python 3.12 or later, and uses CUDA or Apple-silico
 
 ## Limitations and future work
 
-The biggest open gap is screw (image AUROC 0.364), followed by the noisy thresholds that come from small validation sets.
+With PatchCore, every category except toothbrush and screw scores 0.95 or higher; the remaining gaps are small-data categories and the noisy thresholds that come from small validation sets.
 
 **Limitations**
 
@@ -273,8 +316,9 @@ The biggest open gap is screw (image AUROC 0.364), followed by the noisy thresho
 - [x] 512 px input for screw (0.364 → 0.424, still below chance)
 - [x] Report mean ± standard deviation over three runs per category
 - [x] Measure automatic category detection, and replace the score-based rule with nearest neighbors on global features (68.8% → 100% on defective images)
-- [ ] Screw: tile-based inference at full 1024 px resolution, or a rotation-invariant representation
+- [x] Benchmark against PatchCore (implemented on the same features; 0.982 mean image AUROC, screw 0.431 → 0.940)
+- [x] Coreset ablation (1% matches 10% at a tenth of the size)
+- [ ] Add PatchCore's score reweighting to close the gap to the published ~0.99
 - [ ] Add the PRO score, the official MVTec localization metric
 - [ ] Break results down by defect type
-- [ ] Benchmark against PatchCore via `anomalib` on the same categories
 - [ ] Export to ONNX and report CPU latency
