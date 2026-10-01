@@ -2,10 +2,11 @@
 
 Detecting and localizing manufacturing defects **without a single labeled defect** — models are trained only on images of good parts and flag anything that doesn't look normal.
 
-**[Live demo on Hugging Face Spaces](https://huggingface.co/spaces/AradhyaSomani/industrial-anomaly-detection)**
+![Demo](docs/demo.gif)
 
-![Demo](docs/demo.png)
+*Auto-detects the product category, then highlights the defect. Runs locally with `python app.py`.*
 
+📄 **[Technical documentation](docs/TECHNICAL.md)**: architecture, model details, scoring, full results and failure analysis.
 ---
 
 ## Why this problem is hard
